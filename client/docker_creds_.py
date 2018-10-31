@@ -129,6 +129,13 @@ class OAuth2(Basic):
 
 _MAGIC_NOT_FOUND_MESSAGE = 'credentials not found in native keychain'
 
+_DOMAIN_FORMATS = [
+  # Allow naked domains
+  '%s',
+  # Allow scheme-prefixed.
+  'https://%s',
+  'http://%s',
+]
 
 class Helper(Basic):
   """This provider wraps a particularly named credential helper."""
@@ -151,28 +158,38 @@ class Helper(Basic):
 
     bin_name = 'docker-credential-{name}'.format(name=self._name)
     logging.info('Invoking %r to obtain Docker credentials.', bin_name)
-    try:
-      p = subprocess.Popen(
-          [bin_name, 'get'],
-          stdout=subprocess.PIPE,
-          stdin=subprocess.PIPE,
-          stderr=subprocess.STDOUT)
-    except OSError as e:
-      if e.errno == errno.ENOENT:
-        raise Exception('executable not found: ' + bin_name)
-      raise
+
+    def get_credential(registry):
+      try:
+        p = subprocess.Popen(
+            [bin_name, 'get'],
+            stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.STDOUT)
+      except OSError as e:
+        if e.errno == errno.ENOENT:
+          raise Exception('executable not found: ' + bin_name)
+        raise
+      stdout = p.communicate(input=registry)[0]
+      if stdout.strip() == _MAGIC_NOT_FOUND_MESSAGE:
+        return _MAGIC_NOT_FOUND_MESSAGE
+      if p.returncode != 0:
+        raise Exception('Error fetching credential for %s, exit status: %d\n%s' %
+                        (self._name, p.returncode, stdout))
+      return stdout
 
     # Some keychains expect a scheme:
     # https://github.com/bazelbuild/rules_docker/issues/111
-    stdout = p.communicate(input='https://' + self._registry)[0]
-    if stdout.strip() == _MAGIC_NOT_FOUND_MESSAGE:
+    stdout = _MAGIC_NOT_FOUND_MESSAGE
+    for form in _DOMAIN_FORMATS:
+      stdout = get_credential(form % self._registry)
+      if stdout != _MAGIC_NOT_FOUND_MESSAGE:
+        break
+
+    if stdout == _MAGIC_NOT_FOUND_MESSAGE:
       # Use empty auth when no auth is found.
       logging.info('Credentials not found, falling back to anonymous auth.')
       return Anonymous().Get()
-
-    if p.returncode != 0:
-      raise Exception('Error fetching credential for %s, exit status: %d\n%s' %
-                      (self._name, p.returncode, stdout))
 
     blob = json.loads(stdout)
     logging.info('Successfully obtained Docker credentials.')
@@ -196,12 +213,7 @@ class Keychain(six.with_metaclass(abc.ABCMeta, object)):
   # pytype: enable=bad-return-type
 
 
-_FORMATS = [
-    # Allow naked domains
-    '%s',
-    # Allow scheme-prefixed.
-    'https://%s',
-    'http://%s',
+_FORMATS = _DOMAIN_FORMATS + [
     # Allow scheme-prefixes with version in url path.
     'https://%s/v1/',
     'http://%s/v1/',
